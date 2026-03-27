@@ -150,14 +150,3 @@ count,name
 - エンコーディング: UTF-8 / UTF-8 BOM どちらも可
 - `name` は英語名・日本語名どちらでも可（Scryfall で解決）
 
----
-
-## 起動方法
-
-```bash
-# Web UI
-python -m streamlit run app.py --browser.gatherUsageStats false
-
-# CLI
-python main.py --help
-```
