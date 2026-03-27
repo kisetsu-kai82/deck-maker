@@ -19,6 +19,9 @@ env/
 # Streamlit
 .streamlit/
 
+# Claude Code local settings
+.claude/
+
 # IDE
 .vscode/
 .idea/
