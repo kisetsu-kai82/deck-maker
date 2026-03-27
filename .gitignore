@@ -1,0 +1,28 @@
+# Scryfall cache (regenerable)
+.cache/
+
+# Saved decks (personal data)
+decks/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
