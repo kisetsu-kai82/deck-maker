@@ -95,5 +95,40 @@ python -m streamlit run app.py --browser.gatherUsageStats false
   3. 複数件: セッションステート `_candidates` に格納、候補ピッカーUI表示
   4. 0件: エラー表示
 
+---
+
+## 2026-04-04
+
+### テキスト貼り付け一括追加
+- `枚数 カード名` / `カード名 枚数` 両形式に対応
+- `Sideboard` / `サイドボード` 行を検出してそれ以降を自動的にサイド枠へ振り分け
+- 複数候補ピッカーを bulk にも対応（`_paste_pending` session state）
+
+### Adventure/DFC カード日本語名修正
+- `_fetch_japanese_name` で `//` 前の名前を使って検索するよう修正
+- CLB など一部 reprint は Scryfall データが英語のまま → ASCII-only 結果をスキップして非 ASCII 名を優先
+- `search_candidates` の `_to_candidate` も `card_faces[0].printed_name` フォールバック追加
+- `app.py` ロード後バックフィル：`printed_name` 空のカードを `get_card` で自動修正
+
+### produced_mana / 土地分析
+- `Card` に `produced_mana: list[str]` フィールド追加
+- `storage.py` に保存・読み込み・キャッシュ補完（`_cached_produced_mana`）
+- `analysis.py` に `land_stats` / `color_probability_by_turn`（超幾何分布）追加
+- 確率グラフに `Any`（何色でも）・`All`（全色揃う、包除原理）ラインを追加
+
+### メイン／サイドボード分離
+- `Deck` に `sideboard` dict と `add_sideboard_card` / `remove_sideboard_card` / `move_to_sideboard` / `move_to_main` / `clear_sideboard` / `total_sideboard` / `list_sideboard` 追加
+- `storage.py`：`sideboard` セクション保存・読み込み（後方互換）、`_card_to_dict` / `_dict_to_card` ヘルパー追加、`delete_deck` 追加
+- `app.py`：追加先ラジオ（メイン/SB）、→SB / →Main 移動ボタン（↓/↑）、全削除ポップアップ、デッキ削除ポップアップ
+
+### カードリスト2列表示
+- 左列：スペル、右列：土地
+- `_render_section` / `_render_card_rows` ヘルパーで共通化
+
+### Analyze タブ改善
+- `st.bar_chart` / `st.line_chart` → Altair に切り替え（スクロール干渉を解消）
+- レイアウト：確率グラフ（全幅・最上段）→ マナカーブ｜タイプ分布 → 色分布｜マナ生成分布
+- 土地メトリクスを2列外に出して色分布とマナ生成分布の高さを統一
+
 ## 未解決・次回確認事項
 - なし
