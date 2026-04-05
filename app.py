@@ -53,6 +53,147 @@ def type_distribution(deck) -> dict[str, int]:
     return dict(sorted(dist.items(), key=lambda x: -x[1]))
 
 
+_NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7}
+
+
+def _load_oracle_text(name: str) -> str:
+    """カード名からキャッシュの oracle_text を取得する。DFC は各 face を結合。"""
+    import json, pathlib
+    key = name.lower().replace(" ", "_").replace("/", "-")
+    cache_path = pathlib.Path(".cache") / f"{key}.json"
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if "card_faces" in data:
+            return " ".join(f.get("oracle_text", "") for f in data["card_faces"])
+        return data.get("oracle_text", "")
+    except Exception:
+        return ""
+
+
+def _build_flat_deck(deck) -> list[dict]:
+    """カードのcountを展開してシャッフル可能なflatリストを作る。
+    例: 4x Lightning Bolt → [{name:..., ...}, ×4]
+    各カードを独立した dict オブジェクトとして生成することで is 比較が正常動作する。
+    """
+    import random
+    flat = []
+    for card in deck.list_cards():
+        entry = {
+            "name": card.name,
+            "display": card.display_name(),
+            "mana_cost": card.mana_cost,
+            "cmc": int(card.cmc),
+            "type": primary_type(card.type_line),
+            "produced_mana": card.produced_mana or [],
+            "oracle_text": _load_oracle_text(card.name),
+        }
+        flat.extend([dict(entry) for _ in range(card.count)])
+    random.shuffle(flat)
+    return flat
+
+
+def _mana_emoji(mana_cost: str) -> str:
+    """マナコスト文字列（例: {1}{U}{R}）を絵文字表現に変換する。"""
+    if not mana_cost:
+        return "-"
+    mapping = {"W": "⬜", "U": "🔵", "B": "⚫", "R": "🔴", "G": "🟢", "C": "⬛"}
+    result = mana_cost
+    for code, emoji in mapping.items():
+        result = result.replace(f"{{{code}}}", emoji)
+    result = re.sub(r'\{(\d+)\}', r'\1', result)
+    return result
+
+
+def _parse_mana_cost(cost_str: str) -> dict:
+    """{2}{U}{R} → {"generic": 2, "U": 1, "R": 1}。X・ハイブリッドは無視。"""
+    if not cost_str:
+        return {}
+    result: dict = {}
+    for token in re.findall(r'\{([^}]+)\}', cost_str):
+        if token.isdigit():
+            result["generic"] = result.get("generic", 0) + int(token)
+        elif token in ("W", "U", "B", "R", "G", "C"):
+            result[token] = result.get(token, 0) + 1
+    return result
+
+
+def _compute_tapping(battlefield: list, tapped: list, cost_str: str):
+    """スペルを唱えるためにタップする土地インデックスのリストを返す。
+    払えない場合は None を返す。
+
+    各土地は produced_mana の中から1色を選んで出力できる（1色=1マナ）。
+    最も選択肢の少ない色要求を優先して割り当てる（最制約優先の貪欲法）。
+    """
+    cost = _parse_mana_cost(cost_str)
+    if not cost:
+        return []
+
+    colored = {c: v for c, v in cost.items() if c != "generic"}
+    generic = cost.get("generic", 0)
+    avail_idx = [i for i, t in enumerate(tapped) if not t]
+
+    # 色要求をリストに展開し、満たせる土地が少ない色から優先処理
+    reqs = []
+    for color, cnt in colored.items():
+        reqs.extend([color] * cnt)
+    reqs.sort(key=lambda c: sum(
+        1 for i in avail_idx if c in battlefield[i].get("produced_mana", [])
+    ))
+
+    result_tapped = []
+    remaining_avail = list(avail_idx)
+
+    for color in reqs:
+        matched = None
+        for i in remaining_avail:
+            if color in battlefield[i].get("produced_mana", []):
+                matched = i
+                break
+        if matched is None:
+            return None  # この色要求を満たせる土地がない
+        result_tapped.append(matched)
+        remaining_avail.remove(matched)
+
+    # generic 分の土地が残っているか確認してタップ
+    if len(remaining_avail) < generic:
+        return None
+    result_tapped.extend(remaining_avail[:generic])
+    return result_tapped
+
+
+def _detect_hand_effects(oracle_text: str) -> list:
+    """oracle_text から draw/discard/return 効果を検出する。
+    may discard は任意なのでスキップ。draw は即時、discard/return はキュー。
+    """
+    if not oracle_text:
+        return []
+    effects = []
+    text = oracle_text.lower()
+    _num_pat = r'(a|an|\d+|two|three|four|five|six|seven)'
+
+    def _n(s: str) -> int:
+        return _NUM_WORDS.get(s, int(s) if s.isdigit() else 0)
+
+    for m in re.finditer(rf'draw {_num_pat} cards?', text):
+        n = _n(m.group(1))
+        if n > 0:
+            effects.append({"type": "draw", "count": n})
+
+    for m in re.finditer(rf'discard {_num_pat} cards?', text):
+        start = max(0, m.start() - 4)
+        if "may" not in text[start:m.start()]:
+            n = _n(m.group(1))
+            if n > 0:
+                effects.append({"type": "discard", "count": n})
+
+    for m in re.finditer(rf'put {_num_pat} cards? from your hand on top of your library', text):
+        n = _n(m.group(1))
+        if n > 0:
+            effects.append({"type": "return", "count": n})
+
+    return effects
+
+
 def _build_card(data: dict, count: int, ja_name: str = ""):
     """Scryfall API のレスポンス（dict）から Card オブジェクトを生成するヘルパー。
 
@@ -109,6 +250,29 @@ if "_pending_target" not in st.session_state:
 
 if "_paste_pending" not in st.session_state:
     st.session_state._paste_pending = []       # 貼り付け追加の複数候補リスト
+
+if "_sim_hand" not in st.session_state:
+    st.session_state._sim_hand = []            # 現在の手札
+if "_sim_library" not in st.session_state:
+    st.session_state._sim_library = []         # 残りライブラリ
+if "_sim_turn" not in st.session_state:
+    st.session_state._sim_turn = 0             # 現在のターン数（0 = 未開始）
+if "_sim_mulligans" not in st.session_state:
+    st.session_state._sim_mulligans = 0        # マリガン回数
+if "_sim_drawn" not in st.session_state:
+    st.session_state._sim_drawn = None         # 直前のドローカード（ハイライト用）
+if "_sim_deck_name" not in st.session_state:
+    st.session_state._sim_deck_name = None     # デッキ変更検知用
+if "_sim_battlefield" not in st.session_state:
+    st.session_state._sim_battlefield = []     # 戦場に出ている土地
+if "_sim_graveyard" not in st.session_state:
+    st.session_state._sim_graveyard = []       # 墓地（唱えたスペル・捨てたカード）
+if "_sim_lands_played" not in st.session_state:
+    st.session_state._sim_lands_played = 0     # このターンに出した土地数（最大1）
+if "_sim_tapped" not in st.session_state:
+    st.session_state._sim_tapped = []          # battlefield と同インデックスのタップ状態
+if "_sim_pending_effects" not in st.session_state:
+    st.session_state._sim_pending_effects = [] # 未解決エフェクト
 
 
 def reload_deck_list():
@@ -222,7 +386,7 @@ if deck.format:
 
 # ── 2タブ構成 ─────────────────────────────────────────────────────────────────
 # st.tabs(): タブを作る。with ブロックで中身を書く。
-tab_cards, tab_analyze = st.tabs(["Cards", "Analyze"])
+tab_cards, tab_analyze, tab_simulate = st.tabs(["Cards", "Analyze", "Simulate"])
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -766,3 +930,246 @@ with tab_analyze:
             st.altair_chart(_bar(pm_named), use_container_width=True)
         elif ls["land_count"] > 0:
             st.info("土地のマナ生成情報がありません（カードを再取得すると表示されます）。")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Simulate タブ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with tab_simulate:
+
+    # デッキが切り替わったらシミュレーション状態をリセットする
+    if st.session_state._sim_deck_name != selected_deck_name:
+        st.session_state._sim_hand = []
+        st.session_state._sim_library = []
+        st.session_state._sim_turn = 0
+        st.session_state._sim_mulligans = 0
+        st.session_state._sim_drawn = None
+        st.session_state._sim_deck_name = selected_deck_name
+        st.session_state._sim_battlefield = []
+        st.session_state._sim_graveyard = []
+        st.session_state._sim_lands_played = 0
+        st.session_state._sim_tapped = []
+        st.session_state._sim_pending_effects = []
+
+    _sim_initialized = bool(st.session_state._sim_hand or st.session_state._sim_turn > 0)
+
+    if not _sim_initialized:
+        st.info("シャッフルして初手7枚を引くと、マリガンやターン進行をシミュレートできます。")
+        if deck.total_cards() == 0:
+            st.warning("デッキにカードがありません。")
+        elif st.button("🔀 シャッフルして初手を引く", key="sim_start"):
+            flat = _build_flat_deck(deck)
+            st.session_state._sim_hand = flat[:7]
+            st.session_state._sim_library = flat[7:]
+            st.session_state._sim_turn = 1
+            st.session_state._sim_mulligans = 0
+            st.session_state._sim_drawn = None
+            st.session_state._sim_battlefield = []
+            st.session_state._sim_graveyard = []
+            st.session_state._sim_lands_played = 0
+            st.session_state._sim_tapped = []
+            st.session_state._sim_pending_effects = []
+            st.rerun()
+    else:
+        _hand         = st.session_state._sim_hand
+        _library      = st.session_state._sim_library
+        _turn         = st.session_state._sim_turn
+        _mulligans    = st.session_state._sim_mulligans
+        _drawn        = st.session_state._sim_drawn
+        _battlefield  = st.session_state._sim_battlefield
+        _graveyard    = st.session_state._sim_graveyard
+        _lands_played = st.session_state._sim_lands_played
+        _tapped       = st.session_state._sim_tapped
+        _pending      = st.session_state._sim_pending_effects
+
+        # _tapped リストが battlefield と長さが合わない場合（古い state との互換）は補正
+        if len(_tapped) != len(_battlefield):
+            _tapped = [False] * len(_battlefield)
+            st.session_state._sim_tapped = _tapped
+
+        _untapped_count = sum(1 for t in _tapped if not t)
+
+        # ── メトリクス行（5列）──────────────────────────────────────────────
+        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+        sm1.metric("ターン", _turn)
+        sm2.metric("手札", len(_hand))
+        sm3.metric("ライブラリ", len(_library))
+        sm4.metric("未タップ土地", _untapped_count)
+        sm5.metric("マリガン", _mulligans)
+
+        # ── 戦場（土地がある場合のみ）─────────────────────────────────────
+        if _battlefield:
+            _em_map = {"W": "⬜", "U": "🔵", "B": "⚫", "R": "🔴", "G": "🟢", "C": "⬛"}
+            _land_parts = []
+            for _li, _ld in enumerate(_battlefield):
+                _colors_str = "".join(_em_map.get(c, c) for c in _ld.get("produced_mana", []))
+                _tap_mark = "⊤" if _tapped[_li] else "◇"
+                _land_parts.append(f"{_tap_mark}{_ld['display']}({_colors_str or '?'})")
+            st.markdown("🏔 **戦場**: " + "  ".join(_land_parts))
+
+        st.divider()
+
+        # ── 手札表示 ─────────────────────────────────────────────────────
+        if _pending:
+            _eff0 = _pending[0]
+            _verb = "捨てて" if _eff0["type"] == "discard" else "ライブラリへ戻して"
+            st.warning(f"⚠️ {_eff0['count']}枚{_verb}ください")
+
+        st.markdown(f"**手札（{len(_hand)}枚）**")
+        hdr = st.columns([1, 2, 4, 2, 2])
+        hdr[0].markdown("**CMC**")
+        hdr[1].markdown("**マナ**")
+        hdr[2].markdown("**カード名**")
+        hdr[3].markdown("**タイプ**")
+        hdr[4].markdown("**アクション**")
+
+        display_hand = (
+            [c for c in _hand if c is _drawn] + [c for c in _hand if c is not _drawn]
+            if _drawn else list(_hand)
+        )
+
+        for i, card in enumerate(display_hand):
+            is_drawn = (card is _drawn)
+            row = st.columns([1, 2, 4, 2, 2])
+            row[0].write(card["cmc"])
+            row[1].write(_mana_emoji(card["mana_cost"]))
+            row[2].write(f"★ {card['display']}" if is_drawn else card["display"])
+            row[3].write(card["type"])
+
+            if _pending:
+                # ── エフェクト処理中：捨てる / ライブラリへ戻す ──────────
+                _eff = _pending[0]
+                _lbl = "捨てる" if _eff["type"] == "discard" else "↩ 戻す"
+                if row[4].button(_lbl, key=f"pend_{i}_{card['name']}"):
+                    _new_hand = []
+                    _done = False
+                    for c in _hand:
+                        if c is card and not _done:
+                            _done = True
+                            continue
+                        _new_hand.append(c)
+                    _new_pending = list(_pending)
+                    _new_pending[0] = {**_eff, "count": _eff["count"] - 1}
+                    if _new_pending[0]["count"] <= 0:
+                        _new_pending.pop(0)
+                    st.session_state._sim_hand = _new_hand
+                    if _eff["type"] == "discard":
+                        st.session_state._sim_graveyard = list(_graveyard) + [card]
+                    else:
+                        st.session_state._sim_library = [card] + list(_library)
+                    st.session_state._sim_pending_effects = _new_pending
+                    st.rerun()
+
+            elif card["type"] == "Land":
+                # ── 土地：プレイ（色選択なし・戦場にそのまま追加）────────
+                if _lands_played < 1:
+                    if row[4].button("🌍 プレイ", key=f"play_{i}_{card['name']}"):
+                        _new_hand = []
+                        _done = False
+                        for c in _hand:
+                            if c is card and not _done:
+                                _done = True
+                                continue
+                            _new_hand.append(c)
+                        st.session_state._sim_hand = _new_hand
+                        st.session_state._sim_battlefield = list(_battlefield) + [card]
+                        st.session_state._sim_tapped = list(_tapped) + [False]
+                        st.session_state._sim_lands_played = _lands_played + 1
+                        if card is _drawn:
+                            st.session_state._sim_drawn = None
+                        st.rerun()
+                else:
+                    row[4].write("(プレイ済)")
+
+            else:
+                # ── スペル：唱える ───────────────────────────────────────
+                # 未タップ土地の組み合わせでコストを払えるか判定
+                _tap_indices = _compute_tapping(_battlefield, _tapped, card["mana_cost"])
+                if _tap_indices is not None:
+                    if row[4].button("✨ 唱える", key=f"cast_{i}_{card['name']}"):
+                        # 使用した土地をタップ済みにマーク
+                        _new_tapped = list(_tapped)
+                        for _ti in _tap_indices:
+                            _new_tapped[_ti] = True
+
+                        # 手札から除去・墓地へ
+                        _new_hand = []
+                        _done = False
+                        for c in _hand:
+                            if c is card and not _done:
+                                _done = True
+                                continue
+                            _new_hand.append(c)
+                        _new_graveyard = list(_graveyard) + [card]
+
+                        # エフェクト検出・ドロー即時適用
+                        _effs = _detect_hand_effects(card.get("oracle_text", ""))
+                        _new_library = list(_library)
+                        _new_drawn = _drawn if any(c is _drawn for c in _new_hand) else None
+                        for _e in _effs:
+                            if _e["type"] == "draw":
+                                for _ in range(_e["count"]):
+                                    if _new_library:
+                                        _d = _new_library.pop(0)
+                                        _new_hand.append(_d)
+                                        _new_drawn = _d
+
+                        # discard / return をキューへ
+                        _new_pending = list(_pending)
+                        for _e in _effs:
+                            if _e["type"] in ("discard", "return"):
+                                _new_pending.append(_e)
+
+                        st.session_state._sim_hand = _new_hand
+                        st.session_state._sim_library = _new_library
+                        st.session_state._sim_graveyard = _new_graveyard
+                        st.session_state._sim_tapped = _new_tapped
+                        st.session_state._sim_pending_effects = _new_pending
+                        st.session_state._sim_drawn = _new_drawn
+                        st.rerun()
+                else:
+                    row[4].write("(マナ不足)")
+
+        st.divider()
+
+        # ── ボタン行 ─────────────────────────────────────────────────────
+        sb1, sb2, sb3 = st.columns(3)
+        if sb1.button("🎲 マリガン", key="sim_mulligan"):
+            import random
+            all_cards = list(_library) + list(_hand) + list(_battlefield) + list(_graveyard)
+            random.shuffle(all_cards)
+            st.session_state._sim_hand = all_cards[:7]
+            st.session_state._sim_library = all_cards[7:]
+            st.session_state._sim_mulligans += 1
+            st.session_state._sim_drawn = None
+            st.session_state._sim_battlefield = []
+            st.session_state._sim_graveyard = []
+            st.session_state._sim_lands_played = 0
+            st.session_state._sim_tapped = []
+            st.session_state._sim_pending_effects = []
+            st.rerun()
+        if sb2.button(f"➡ ターン{_turn + 1}へ（ドロー）", key="sim_draw"):
+            if _library:
+                _drawn_card = _library[0]
+                st.session_state._sim_hand = list(_hand) + [_drawn_card]
+                st.session_state._sim_library = _library[1:]
+                st.session_state._sim_turn += 1
+                st.session_state._sim_drawn = _drawn_card
+                st.session_state._sim_lands_played = 0
+                # アンタップ：全土地を未タップ状態に戻す
+                st.session_state._sim_tapped = [False] * len(_battlefield)
+                st.rerun()
+            else:
+                st.error("ライブラリが空です。")
+        if sb3.button("🔄 リセット", key="sim_reset"):
+            st.session_state._sim_hand = []
+            st.session_state._sim_library = []
+            st.session_state._sim_turn = 0
+            st.session_state._sim_mulligans = 0
+            st.session_state._sim_drawn = None
+            st.session_state._sim_battlefield = []
+            st.session_state._sim_graveyard = []
+            st.session_state._sim_lands_played = 0
+            st.session_state._sim_tapped = []
+            st.session_state._sim_pending_effects = []
+            st.rerun()
