@@ -84,6 +84,7 @@ def _build_flat_deck(deck) -> list[dict]:
             "mana_cost": card.mana_cost,
             "cmc": int(card.cmc),
             "type": primary_type(card.type_line),
+            "type_line": card.type_line,
             "produced_mana": card.produced_mana or [],
             "oracle_text": _load_oracle_text(card.name),
         }
@@ -161,6 +162,25 @@ def _compute_tapping(battlefield: list, tapped: list, cost_str: str):
     return result_tapped
 
 
+def _is_tapland(oracle_text: str) -> bool:
+    """タップインランドかどうかを oracle_text から判定する。"""
+    return "enters tapped" in oracle_text.lower()
+
+
+def _is_fetchland(oracle_text: str) -> bool:
+    """フェッチランドかどうかを oracle_text から判定する。"""
+    t = oracle_text.lower()
+    return "sacrifice" in t and "search your library for" in t and "put it onto the battlefield" in t
+
+
+def _fetch_filter(oracle_text: str) -> str:
+    """フェッチランドの oracle_text からサーチ対象の土地タイプ文字列を抽出する。
+    例: 'Search your library for an Island or Mountain card' → 'island or mountain'
+    """
+    m = re.search(r'search your library for (?:a |an )?([\w\s]+?) card', oracle_text.lower())
+    return m.group(1).strip() if m else ""
+
+
 def _detect_hand_effects(oracle_text: str) -> list:
     """oracle_text から draw/discard/return 効果を検出する。
     may discard は任意なのでスキップ。draw は即時、discard/return はキュー。
@@ -190,6 +210,36 @@ def _detect_hand_effects(oracle_text: str) -> list:
         n = _n(m.group(1))
         if n > 0:
             effects.append({"type": "return", "count": n})
+
+    for m in re.finditer(rf'scry {_num_pat}', text):
+        n = _n(m.group(1))
+        if n > 0:
+            effects.append({"type": "scry", "count": n})
+
+    for m in re.finditer(rf'surveil {_num_pat}', text):
+        n = _n(m.group(1))
+        if n > 0:
+            effects.append({"type": "surveil", "count": n})
+
+    for m in re.finditer(rf'mill {_num_pat}', text):
+        n = _n(m.group(1))
+        if n > 0:
+            effects.append({"type": "mill", "count": n})
+
+    for m in re.finditer(rf'look at the top {_num_pat} cards? of your library', text):
+        after = text[m.end():]
+        if re.search(r'put (?:one|a card)(?: of them)? into your hand', after):
+            rest = "graveyard" if "put the rest into your graveyard" in after else "bottom"
+            n = _n(m.group(1))
+            if n > 0:
+                effects.append({"type": "impulse", "count": n, "rest": rest})
+
+    m_tutor = re.search(r'search your library for (?:a |an )?([\w\s,]+?) card', text)
+    if m_tutor and re.search(r'put (?:it|that card) into your hand', text):
+        effects.append({"type": "tutor", "filter": m_tutor.group(1).strip()})
+
+    if re.search(r'return (?:target |a )?(?:[\w\s]+ )?card from your graveyard to your hand', text):
+        effects.append({"type": "graveyard_return", "count": 1})
 
     return effects
 
@@ -1012,8 +1062,174 @@ with tab_simulate:
         # ── 手札表示 ─────────────────────────────────────────────────────
         if _pending:
             _eff0 = _pending[0]
-            _verb = "捨てて" if _eff0["type"] == "discard" else "ライブラリへ戻して"
-            st.warning(f"⚠️ {_eff0['count']}枚{_verb}ください")
+            _eff0_type = _eff0["type"]
+
+            if _eff0_type in ("discard", "return"):
+                _verb = "捨てて" if _eff0_type == "discard" else "ライブラリへ戻して"
+                st.warning(f"⚠️ {_eff0['count']}枚{_verb}ください")
+
+            elif _eff0_type in ("scry", "surveil"):
+                _sc_cards = _eff0["cards"]
+                _sc_label = "Scry" if _eff0_type == "scry" else "Surveil"
+                st.info(f"🔮 **{_sc_label}**: カードを確認してください（残り {len(_sc_cards)} 枚）")
+                _sc_card = _sc_cards[0]
+                if _eff0_type == "surveil":
+                    _scc = st.columns([3, 1, 2, 2, 2, 2])
+                else:
+                    _scc = st.columns([3, 1, 2, 2, 2])
+                _scc[0].write(_sc_card["display"])
+                _scc[1].write(_sc_card["cmc"])
+                _scc[2].write(_sc_card["type"])
+                _sc_rest = list(_sc_cards[1:])
+                _sc_np = list(_pending)
+                if _scc[3].button("▲ トップ", key=f"sc_top_{len(_sc_cards)}"):
+                    if _sc_rest:
+                        _sc_np[0] = {**_eff0, "cards": _sc_rest}
+                    else:
+                        _sc_np.pop(0)
+                    st.session_state._sim_library = [_sc_card] + list(_library)
+                    st.session_state._sim_pending_effects = _sc_np
+                    st.rerun()
+                if _scc[4].button("▼ 底へ", key=f"sc_bot_{len(_sc_cards)}"):
+                    if _sc_rest:
+                        _sc_np[0] = {**_eff0, "cards": _sc_rest}
+                    else:
+                        _sc_np.pop(0)
+                    st.session_state._sim_library = list(_library) + [_sc_card]
+                    st.session_state._sim_pending_effects = _sc_np
+                    st.rerun()
+                if _eff0_type == "surveil":
+                    if _scc[5].button("🪦 墓地へ", key=f"sc_gy_{len(_sc_cards)}"):
+                        if _sc_rest:
+                            _sc_np[0] = {**_eff0, "cards": _sc_rest}
+                        else:
+                            _sc_np.pop(0)
+                        st.session_state._sim_graveyard = list(_graveyard) + [_sc_card]
+                        st.session_state._sim_pending_effects = _sc_np
+                        st.rerun()
+
+            elif _eff0_type == "impulse":
+                _imp_cards = _eff0["cards"]
+                _imp_rest = _eff0.get("rest", "bottom")
+                _rest_label = "底" if _imp_rest == "bottom" else "墓地"
+                st.info(f"🔍 **Impulse**: {len(_imp_cards)} 枚から 1 枚を選んでください（残りは{_rest_label}に置かれます）")
+                for _ii, _ic in enumerate(_imp_cards):
+                    _ir = st.columns([3, 1, 2, 2])
+                    _ir[0].write(_ic["display"])
+                    _ir[1].write(_ic["cmc"])
+                    _ir[2].write(_ic["type"])
+                    if _ir[3].button("手札に加える", key=f"imp_{_ii}_{_ic['name']}"):
+                        _np = list(_pending)
+                        _np.pop(0)
+                        _rest_cards = [c for c in _imp_cards if c is not _ic]
+                        _nl = list(_library)
+                        _ng = list(_graveyard)
+                        if _imp_rest == "bottom":
+                            _nl = _nl + _rest_cards
+                        else:
+                            _ng = _ng + _rest_cards
+                        st.session_state._sim_hand = list(_hand) + [_ic]
+                        st.session_state._sim_library = _nl
+                        st.session_state._sim_graveyard = _ng
+                        st.session_state._sim_pending_effects = _np
+                        st.rerun()
+
+            elif _eff0_type == "tutor":
+                _t_filter = _eff0.get("filter", "")
+                st.info(f"🔎 **Tutor**: ライブラリから **{_t_filter}** カードを選んでください")
+                _t_search = st.text_input("検索", key="tutor_search_box", placeholder="カード名で絞り込む")
+                _t_candidates = [
+                    c for c in _library
+                    if _t_filter.lower() in c.get("type", "").lower()
+                    or _t_filter.lower() in c.get("name", "").lower()
+                ]
+                if _t_search:
+                    _t_candidates = [c for c in _t_candidates if _t_search.lower() in c["display"].lower()]
+                if not _t_candidates:
+                    st.warning("条件に合うカードがライブラリにありません。")
+                    if st.button("スキップ", key="tutor_skip"):
+                        _np = list(_pending)
+                        _np.pop(0)
+                        st.session_state._sim_pending_effects = _np
+                        st.rerun()
+                else:
+                    for _ti, _tc in enumerate(_t_candidates):
+                        _tr = st.columns([3, 1, 2, 2])
+                        _tr[0].write(_tc["display"])
+                        _tr[1].write(_tc["cmc"])
+                        _tr[2].write(_tc["type"])
+                        if _tr[3].button("選択", key=f"tut_{_ti}_{_tc['name']}"):
+                            import random
+                            _np = list(_pending)
+                            _np.pop(0)
+                            _nl = [c for c in _library if c is not _tc]
+                            random.shuffle(_nl)
+                            st.session_state._sim_hand = list(_hand) + [_tc]
+                            st.session_state._sim_library = _nl
+                            st.session_state._sim_pending_effects = _np
+                            st.rerun()
+
+            elif _eff0_type == "graveyard_return":
+                st.info("♻️ **墓地から 1 枚を手札に戻してください**")
+                if not _graveyard:
+                    st.warning("墓地にカードがありません。")
+                    if st.button("スキップ", key="gy_ret_skip"):
+                        _np = list(_pending)
+                        _np.pop(0)
+                        st.session_state._sim_pending_effects = _np
+                        st.rerun()
+                else:
+                    for _gi, _gc in enumerate(_graveyard):
+                        _gr = st.columns([3, 1, 2, 2])
+                        _gr[0].write(_gc["display"])
+                        _gr[1].write(_gc["cmc"])
+                        _gr[2].write(_gc["type"])
+                        if _gr[3].button("手札に戻す", key=f"gy_ret_{_gi}_{_gc['name']}"):
+                            _np = list(_pending)
+                            _np.pop(0)
+                            _ng = [c for c in _graveyard if c is not _gc]
+                            st.session_state._sim_hand = list(_hand) + [_gc]
+                            st.session_state._sim_graveyard = _ng
+                            st.session_state._sim_pending_effects = _np
+                            st.rerun()
+
+            elif _eff0_type == "fetch":
+                _f_filter = _eff0.get("filter", "")
+                st.info(f"🔍 **フェッチ**: ライブラリから **{_f_filter or '土地'}** カードを選んでください（タップインで場に出ます）")
+                # filter: "island or mountain" → ["island", "mountain"]
+                _f_types = [w.strip() for w in _f_filter.split(" or ")] if _f_filter else []
+                _f_candidates = [
+                    c for c in _library
+                    if c.get("type") == "Land" and (
+                        not _f_types
+                        or any(ft in c.get("type_line", "").lower() for ft in _f_types)
+                    )
+                ]
+                if not _f_candidates:
+                    st.warning("条件に合う土地がライブラリにありません。")
+                    if st.button("スキップ", key="fetch_skip"):
+                        _np = list(_pending)
+                        _np.pop(0)
+                        st.session_state._sim_pending_effects = _np
+                        st.rerun()
+                else:
+                    for _fi, _fc in enumerate(_f_candidates):
+                        _fr = st.columns([3, 2, 2, 2])
+                        _fr[0].write(_fc["display"])
+                        _fr[1].write(_fc.get("type_line", _fc["type"]))
+                        _fr[2].write("".join({"W":"⬜","U":"🔵","B":"⚫","R":"🔴","G":"🟢","C":"⬛"}.get(c,c) for c in _fc.get("produced_mana",[])))
+                        if _fr[3].button("選択", key=f"fetch_{_fi}_{_fc['name']}"):
+                            import random
+                            _np = list(_pending)
+                            _np.pop(0)
+                            _nl = [c for c in _library if c is not _fc]
+                            random.shuffle(_nl)
+                            # フェッチで場に出た土地はタップ状態
+                            st.session_state._sim_battlefield = list(_battlefield) + [_fc]
+                            st.session_state._sim_tapped = list(_tapped) + [True]
+                            st.session_state._sim_library = _nl
+                            st.session_state._sim_pending_effects = _np
+                            st.rerun()
 
         st.markdown(f"**手札（{len(_hand)}枚）**")
         hdr = st.columns([1, 2, 4, 2, 2])
@@ -1037,33 +1253,11 @@ with tab_simulate:
             row[3].write(card["type"])
 
             if _pending:
-                # ── エフェクト処理中：捨てる / ライブラリへ戻す ──────────
                 _eff = _pending[0]
-                _lbl = "捨てる" if _eff["type"] == "discard" else "↩ 戻す"
-                if row[4].button(_lbl, key=f"pend_{i}_{card['name']}"):
-                    _new_hand = []
-                    _done = False
-                    for c in _hand:
-                        if c is card and not _done:
-                            _done = True
-                            continue
-                        _new_hand.append(c)
-                    _new_pending = list(_pending)
-                    _new_pending[0] = {**_eff, "count": _eff["count"] - 1}
-                    if _new_pending[0]["count"] <= 0:
-                        _new_pending.pop(0)
-                    st.session_state._sim_hand = _new_hand
-                    if _eff["type"] == "discard":
-                        st.session_state._sim_graveyard = list(_graveyard) + [card]
-                    else:
-                        st.session_state._sim_library = [card] + list(_library)
-                    st.session_state._sim_pending_effects = _new_pending
-                    st.rerun()
-
-            elif card["type"] == "Land":
-                # ── 土地：プレイ（色選択なし・戦場にそのまま追加）────────
-                if _lands_played < 1:
-                    if row[4].button("🌍 プレイ", key=f"play_{i}_{card['name']}"):
+                if _eff["type"] in ("discard", "return"):
+                    # ── エフェクト処理中：捨てる / ライブラリへ戻す ──────────
+                    _lbl = "捨てる" if _eff["type"] == "discard" else "↩ 戻す"
+                    if row[4].button(_lbl, key=f"pend_{i}_{card['name']}"):
                         _new_hand = []
                         _done = False
                         for c in _hand:
@@ -1071,12 +1265,53 @@ with tab_simulate:
                                 _done = True
                                 continue
                             _new_hand.append(c)
+                        _new_pending = list(_pending)
+                        _new_pending[0] = {**_eff, "count": _eff["count"] - 1}
+                        if _new_pending[0]["count"] <= 0:
+                            _new_pending.pop(0)
                         st.session_state._sim_hand = _new_hand
-                        st.session_state._sim_battlefield = list(_battlefield) + [card]
-                        st.session_state._sim_tapped = list(_tapped) + [False]
-                        st.session_state._sim_lands_played = _lands_played + 1
+                        if _eff["type"] == "discard":
+                            st.session_state._sim_graveyard = list(_graveyard) + [card]
+                        else:
+                            st.session_state._sim_library = [card] + list(_library)
+                        st.session_state._sim_pending_effects = _new_pending
+                        st.rerun()
+                else:
+                    row[4].write("(処理中)")
+
+            elif card["type"] == "Land":
+                # ── 土地：プレイ（タップイン・フェッチ対応）────────────
+                if _lands_played < 1:
+                    _oracle = card.get("oracle_text", "")
+                    _is_tap  = _is_tapland(_oracle)
+                    _is_fetch = _is_fetchland(_oracle)
+                    if _is_fetch:
+                        _play_lbl = "🌍 フェッチ"
+                    elif _is_tap:
+                        _play_lbl = "🌍 プレイ (タップイン)"
+                    else:
+                        _play_lbl = "🌍 プレイ"
+                    if row[4].button(_play_lbl, key=f"play_{i}_{card['name']}"):
+                        _new_hand = []
+                        _done = False
+                        for c in _hand:
+                            if c is card and not _done:
+                                _done = True
+                                continue
+                            _new_hand.append(c)
                         if card is _drawn:
                             st.session_state._sim_drawn = None
+                        st.session_state._sim_hand = _new_hand
+                        st.session_state._sim_lands_played = _lands_played + 1
+                        if _is_fetch:
+                            # フェッチランドは墓地へ → fetch pending を追加
+                            st.session_state._sim_graveyard = list(_graveyard) + [card]
+                            _filt = _fetch_filter(_oracle)
+                            st.session_state._sim_pending_effects = list(_pending) + [{"type": "fetch", "filter": _filt}]
+                        else:
+                            # 通常 or タップインランド（タップイン時は tapped=True）
+                            st.session_state._sim_battlefield = list(_battlefield) + [card]
+                            st.session_state._sim_tapped = list(_tapped) + [_is_tap]
                         st.rerun()
                 else:
                     row[4].write("(プレイ済)")
@@ -1114,10 +1349,31 @@ with tab_simulate:
                                         _new_hand.append(_d)
                                         _new_drawn = _d
 
-                        # discard / return をキューへ
+                        # エフェクトをキューへ / 即時適用
                         _new_pending = list(_pending)
                         for _e in _effs:
-                            if _e["type"] in ("discard", "return"):
+                            _et = _e["type"]
+                            if _et in ("discard", "return"):
+                                _new_pending.append(_e)
+                            elif _et == "mill":
+                                for _ in range(_e["count"]):
+                                    if _new_library:
+                                        _new_graveyard.append(_new_library.pop(0))
+                            elif _et in ("scry", "surveil"):
+                                _extracted = []
+                                for _ in range(_e["count"]):
+                                    if _new_library:
+                                        _extracted.append(_new_library.pop(0))
+                                if _extracted:
+                                    _new_pending.append({"type": _et, "cards": _extracted})
+                            elif _et == "impulse":
+                                _extracted = []
+                                for _ in range(_e["count"]):
+                                    if _new_library:
+                                        _extracted.append(_new_library.pop(0))
+                                if _extracted:
+                                    _new_pending.append({"type": "impulse", "cards": _extracted, "rest": _e.get("rest", "bottom")})
+                            elif _et in ("tutor", "graveyard_return"):
                                 _new_pending.append(_e)
 
                         st.session_state._sim_hand = _new_hand
