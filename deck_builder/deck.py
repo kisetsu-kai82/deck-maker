@@ -75,6 +75,17 @@ class Deck:
             return True
         return False
 
+    def set_card_count(self, name: str, count: int) -> bool:
+        """メインデッキのカード枚数を変更する（0以下なら削除）。"""
+        key = name.lower()
+        if key not in self.cards:
+            return False
+        if count <= 0:
+            del self.cards[key]
+        else:
+            self.cards[key].count = count
+        return True
+
     # ── サイドボード操作 ──────────────────────
 
     def add_sideboard_card(self, card: Card, count: int = 1) -> None:
@@ -93,6 +104,17 @@ class Deck:
             del self.sideboard[key]
             return True
         return False
+
+    def set_sideboard_count(self, name: str, count: int) -> bool:
+        """サイドボードのカード枚数を変更する（0以下なら削除）。"""
+        key = name.lower()
+        if key not in self.sideboard:
+            return False
+        if count <= 0:
+            del self.sideboard[key]
+        else:
+            self.sideboard[key].count = count
+        return True
 
     # ── メイン ⇔ サイドボード 移動 ──────────
 

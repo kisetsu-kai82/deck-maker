@@ -118,24 +118,57 @@ def _parse_mana_cost(cost_str: str) -> dict:
     return result
 
 
-def _compute_tapping(battlefield: list, tapped: list, cost_str: str):
+def _compute_tapping(battlefield: list, tapped: list, cost_str: str, mana_pool: dict | None = None):
     """スペルを唱えるためにタップする土地インデックスのリストを返す。
-    払えない場合は None を返す。
+    払えない場合は (None, None) を返す。成功時は (tap_indices, pool_after) を返す。
 
+    フローティングマナ (mana_pool) を優先消費し、不足分を土地・マナクリの自動タップで補う。
     各土地は produced_mana の中から1色を選んで出力できる（1色=1マナ）。
     最も選択肢の少ない色要求を優先して割り当てる（最制約優先の貪欲法）。
     """
     cost = _parse_mana_cost(cost_str)
     if not cost:
-        return []
+        return [], dict(mana_pool) if mana_pool else {}
 
+    pool = dict(mana_pool) if mana_pool else {}
     colored = {c: v for c, v in cost.items() if c != "generic"}
     generic = cost.get("generic", 0)
+
+    # フローティングマナから色マナを優先消費
+    remaining_colored = {}
+    for color, cnt in colored.items():
+        pool_have = pool.get(color, 0)
+        consumed = min(pool_have, cnt)
+        if consumed > 0:
+            pool[color] = pool_have - consumed
+            if pool[color] == 0:
+                del pool[color]
+        remaining = cnt - consumed
+        if remaining > 0:
+            remaining_colored[color] = remaining
+
+    # フローティングマナからジェネリックを消費（残り全色を使用可）
+    remaining_generic = generic
+    if remaining_generic > 0:
+        pool_total = sum(pool.values())
+        consumed_g = min(pool_total, remaining_generic)
+        if consumed_g > 0:
+            remaining_generic -= consumed_g
+            # プールから任意の色を消費（辞書順）
+            for c in list(pool.keys()):
+                if consumed_g <= 0:
+                    break
+                take = min(pool[c], consumed_g)
+                pool[c] -= take
+                consumed_g -= take
+                if pool[c] == 0:
+                    del pool[c]
+
+    # 残りを土地・マナクリの自動タップで補う
     avail_idx = [i for i, t in enumerate(tapped) if not t]
 
-    # 色要求をリストに展開し、満たせる土地が少ない色から優先処理
     reqs = []
-    for color, cnt in colored.items():
+    for color, cnt in remaining_colored.items():
         reqs.extend([color] * cnt)
     reqs.sort(key=lambda c: sum(
         1 for i in avail_idx if c in battlefield[i].get("produced_mana", [])
@@ -151,15 +184,15 @@ def _compute_tapping(battlefield: list, tapped: list, cost_str: str):
                 matched = i
                 break
         if matched is None:
-            return None  # この色要求を満たせる土地がない
+            return None, None  # この色要求を満たせる土地がない
         result_tapped.append(matched)
         remaining_avail.remove(matched)
 
     # generic 分の土地が残っているか確認してタップ
-    if len(remaining_avail) < generic:
-        return None
-    result_tapped.extend(remaining_avail[:generic])
-    return result_tapped
+    if len(remaining_avail) < remaining_generic:
+        return None, None
+    result_tapped.extend(remaining_avail[:remaining_generic])
+    return result_tapped, pool
 
 
 def _is_tapland(oracle_text: str) -> bool:
@@ -171,6 +204,17 @@ def _is_fetchland(oracle_text: str) -> bool:
     """フェッチランドかどうかを oracle_text から判定する。"""
     t = oracle_text.lower()
     return "sacrifice" in t and "search your library for" in t and "put it onto the battlefield" in t
+
+
+def _is_summoning_sick(perm: dict, turn: int) -> bool:
+    """パーマネントが召喚酔い状態かどうかを返す。
+    type_line に Creature が含まれ、Haste がなく、このターンに戦場へ出た場合に True。
+    """
+    if "Creature" not in perm.get("type_line", ""):
+        return False
+    if "haste" in perm.get("oracle_text", "").lower():
+        return False
+    return perm.get("entered_turn", -1) == turn
 
 
 def _fetch_filter(oracle_text: str) -> str:
@@ -410,6 +454,8 @@ if "_sim_pending_effects" not in st.session_state:
     st.session_state._sim_pending_effects = [] # 未解決エフェクト
 if "_sim_alt_cast_card" not in st.session_state:
     st.session_state._sim_alt_cast_card = None # 代替コストで唱えるカード
+if "_sim_mana_pool" not in st.session_state:
+    st.session_state._sim_mana_pool = {}       # フローティングマナ {色文字: 枚数}
 
 
 def reload_deck_list():
@@ -573,7 +619,7 @@ with tab_cards:
                         st.success(f"{card.display_name()} x{int(card_count_input)} を追加しました。")
                         st.rerun()
                     except ValueError:
-                        # 完全一致で見つからなかった → 候補検索
+                        # 完全一致で見つからなかった → 候補検索（完全一致が先頭に来るよう内部でソート済み）
                         candidates = client.search_candidates(card_name_input.strip())
                         if not candidates:
                             st.error("カードが見つかりませんでした。")
@@ -843,8 +889,24 @@ with tab_cards:
     # ── カード一覧テーブル ────────────────────────────────────────────────────
     st.divider()
 
+    # 枚数 number_input: ネイティブスピナーを常時表示・コンパクト化
+    st.markdown("""
+    <style>
+    input[data-testid="stNumberInputField"] {
+        text-align: center;
+        font-size: 0.85rem;
+    }
+    input[data-testid="stNumberInputField"]::-webkit-inner-spin-button,
+    input[data-testid="stNumberInputField"]::-webkit-outer-spin-button {
+        -webkit-appearance: auto !important;
+        opacity: 1 !important;
+        cursor: pointer;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     # テーブルの列幅比率 [枚数, カード名, タイプ, マナコスト, CMC, 移動, 削除]
-    _CARD_COLS = [1, 3, 2, 2, 1, 1, 1]
+    _CARD_COLS = [4, 5, 2, 2, 1, 1, 1]
 
     def _card_table_header(container):
         """テーブルのヘッダー行を描画する。container は st の列（column）オブジェクト。"""
@@ -857,7 +919,7 @@ with tab_cards:
         h[5].markdown("**移動**")
         # h[6] は削除ボタン用（ヘッダーなし）
 
-    def _render_card_rows(container, cards, move_btn_label, move_fn, del_fn, key_prefix):
+    def _render_card_rows(container, cards, move_btn_label, move_fn, del_fn, set_count_fn, key_prefix):
         """カード一覧の各行を描画する。
 
         container     : 描画先の Streamlit コンテナ（列など）
@@ -865,6 +927,7 @@ with tab_cards:
         move_btn_label: 移動ボタンのラベル（"↓" or "↑"）
         move_fn       : 移動ボタンを押したときに呼ぶ関数（deck.move_to_sideboard など）
         del_fn        : 削除ボタンを押したときに呼ぶ関数（deck.remove_card など）
+        set_count_fn  : 枚数変更関数（deck.set_card_count など）
         key_prefix    : 各ボタンのキーの接頭辞（同名ボタンの衝突を避ける）
         """
         if not cards:
@@ -873,7 +936,20 @@ with tab_cards:
         _card_table_header(container)
         for card in cards:
             rc = container.columns(_CARD_COLS)
-            rc[0].write(card.count)
+            # rc[0]: number_input（MTG プロジェクトの <input type="number"> と同等）
+            count_key = f"{st.session_state.get('selected_deck', '')}_{key_prefix}_cnt_{card.name}"
+            new_count = rc[0].number_input(
+                "枚数",
+                min_value=1, max_value=99,
+                value=card.count,
+                step=1,
+                key=count_key,
+                label_visibility="collapsed",
+            )
+            if new_count != card.count:
+                set_count_fn(card.name, new_count)
+                save_deck(deck)
+                st.rerun()
             rc[1].write(card.display_name())
             rc[2].write(primary_type(card.type_line))
             rc[3].write(card.mana_cost)
@@ -887,7 +963,7 @@ with tab_cards:
                 save_deck(deck)
                 st.rerun()
 
-    def _render_section(cards, title, clear_key, clear_fn, move_btn_label, move_fn, del_fn, key_prefix):
+    def _render_section(cards, title, clear_key, clear_fn, move_btn_label, move_fn, del_fn, set_count_fn, key_prefix):
         """メインデッキ or サイドボードの1セクションを描画する。
 
         タイトル・全削除ボタン・2列レイアウト（スペル | 土地）で構成される。
@@ -910,10 +986,10 @@ with tab_cards:
         left, right = st.columns(2)
         with left:
             st.caption(f"スペル（{sum(c.count for c in spells)}枚）")
-            _render_card_rows(left, spells, move_btn_label, move_fn, del_fn, key_prefix + "_sp")
+            _render_card_rows(left, spells, move_btn_label, move_fn, del_fn, set_count_fn, key_prefix + "_sp")
         with right:
             st.caption(f"土地（{sum(c.count for c in lands)}枚）")
-            _render_card_rows(right, lands, move_btn_label, move_fn, del_fn, key_prefix + "_ld")
+            _render_card_rows(right, lands, move_btn_label, move_fn, del_fn, set_count_fn, key_prefix + "_ld")
 
     # メインデッキとサイドボードを描画する
     main_cards = deck.list_cards()
@@ -925,6 +1001,7 @@ with tab_cards:
         "clear_main", deck.clear_cards,
         "↓",           # メインデッキのカードはサイドへ移動（↓）
         deck.move_to_sideboard, deck.remove_card,
+        deck.set_card_count,
         "main",
     )
 
@@ -934,6 +1011,7 @@ with tab_cards:
         "clear_sb", deck.clear_sideboard,
         "↑",          # サイドボードのカードはメインへ移動（↑）
         deck.move_to_main, deck.remove_sideboard_card,
+        deck.set_sideboard_count,
         "sb",
     )
 
@@ -1088,6 +1166,7 @@ with tab_simulate:
         st.session_state._sim_tapped = []
         st.session_state._sim_pending_effects = []
         st.session_state._sim_alt_cast_card = None
+        st.session_state._sim_mana_pool = {}
 
     _sim_initialized = bool(st.session_state._sim_hand or st.session_state._sim_turn > 0)
 
@@ -1108,6 +1187,7 @@ with tab_simulate:
             st.session_state._sim_tapped = []
             st.session_state._sim_pending_effects = []
             st.session_state._sim_alt_cast_card = None
+            st.session_state._sim_mana_pool = {}
             st.rerun()
     else:
         _hand         = st.session_state._sim_hand
@@ -1127,7 +1207,7 @@ with tab_simulate:
             _alt_cast_card = None
         _alt_casting = (_alt_cast_card is not None) and not _pending
 
-        def _execute_cast(card, tap_indices):
+        def _execute_cast(card, tap_indices, pool_after=None):
             """スペルを唱える共通処理（通常・代替コスト共用）。"""
             _new_tapped = list(_tapped)
             for _ti in tap_indices:
@@ -1142,7 +1222,9 @@ with tab_simulate:
             # パーマネント（クリーチャー/アーティファクト/エンチャント/PW）は戦場へ
             _PERM_TYPES = {"Creature", "Artifact", "Enchantment", "Planeswalker"}
             if card.get("type") in _PERM_TYPES:
-                _new_battlefield = list(_battlefield) + [card]
+                _entering = dict(card)
+                _entering["entered_turn"] = _turn
+                _new_battlefield = list(_battlefield) + [_entering]
                 _new_tapped.append(False)
                 _new_graveyard = list(_graveyard)
             else:
@@ -1190,6 +1272,7 @@ with tab_simulate:
                         "mana_cost": "", "cmc": 0,
                         "type": "Creature", "type_line": "Token Creature",
                         "produced_mana": [], "oracle_text": "", "is_token": True,
+                        "entered_turn": _turn,
                     }
                     for _ in range(_e["count"]):
                         _new_battlefield.append(dict(_tok_base))
@@ -1202,6 +1285,7 @@ with tab_simulate:
             st.session_state._sim_pending_effects = _new_pending
             st.session_state._sim_drawn = _new_drawn
             st.session_state._sim_alt_cast_card = None
+            st.session_state._sim_mana_pool = pool_after if pool_after is not None else {}
             st.rerun()
 
         def _play_land(card, tapped: bool, extra_pending: list | None = None, new_library: list | None = None):
@@ -1236,6 +1320,7 @@ with tab_simulate:
             st.session_state._sim_tapped = _tapped
 
         _untapped_count = sum(1 for t in _tapped if not t)
+        _em_map = {"W": "⬜", "U": "🔵", "B": "⚫", "R": "🔴", "G": "🟢", "C": "⬛"}
 
         # ── メトリクス行（5列）──────────────────────────────────────────────
         sm1, sm2, sm3, sm4, sm5 = st.columns(5)
@@ -1244,9 +1329,14 @@ with tab_simulate:
         sm3.metric("ライブラリ", len(_library))
         sm4.metric("未タップ土地", _untapped_count)
         sm5.metric("マリガン", _mulligans)
+        _cur_mana_pool = st.session_state.get("_sim_mana_pool", {})
+        if _cur_mana_pool:
+            _pool_str = "  ".join(
+                "".join([_em_map.get(c, c)] * n) for c, n in _cur_mana_pool.items()
+            )
+            st.caption(f"🔮 フローティングマナ: {_pool_str}")
 
         # ── 戦場（土地 + 非土地パーマネント）────────────────────────────
-        _em_map = {"W": "⬜", "U": "🔵", "B": "⚫", "R": "🔴", "G": "🟢", "C": "⬛"}
         _lands_bf  = [(i, c) for i, c in enumerate(_battlefield) if c.get("type") == "Land"]
         _perms_bf  = [(i, c) for i, c in enumerate(_battlefield) if c.get("type") != "Land"]
         if _lands_bf:
@@ -1261,16 +1351,27 @@ with tab_simulate:
             for _pi, (_perm_i, _perm) in enumerate(_perms_bf):
                 _pr = st.columns([4, 2, 2, 1])
                 _ptap = "⊤" if _tapped[_perm_i] else "◇"
-                _pr[0].write(f"{_ptap} {_perm['display']}")
+                _sick = _is_summoning_sick(_perm, _turn)
+                _sick_mark = " 😴" if _sick else ""
+                _pr[0].write(f"{_ptap} {_perm['display']}{_sick_mark}")
                 _pr[1].write(_perm.get("type", ""))
                 _pem_colors = _perm.get("produced_mana", [])
                 if _pem_colors and not _tapped[_perm_i]:
-                    _pem_str = "".join(_em_map.get(c, c) for c in _pem_colors)
-                    if _pr[2].button(f"🔱{_pem_str}", key=f"tap_perm_{_perm_i}_{_perm['name']}_{_pi}"):
-                        _nt = list(_tapped)
-                        _nt[_perm_i] = True
-                        st.session_state._sim_tapped = _nt
-                        st.rerun()
+                    if _sick:
+                        _pr[2].write("召喚酔い")
+                    else:
+                        _unique_pem_colors = list(dict.fromkeys(_pem_colors))  # 重複除去・順序保持
+                        _tap_btns = _pr[2].columns(len(_unique_pem_colors))
+                        for _ci, _color in enumerate(_unique_pem_colors):
+                            _btn_label = f"🔱{_em_map.get(_color, _color)}"
+                            if _tap_btns[_ci].button(_btn_label, key=f"tap_perm_{_perm_i}_{_perm['name']}_{_color}_{_pi}"):
+                                _nt = list(_tapped)
+                                _nt[_perm_i] = True
+                                _np = dict(st.session_state.get("_sim_mana_pool", {}))
+                                _np[_color] = _np.get(_color, 0) + 1
+                                st.session_state._sim_tapped = _nt
+                                st.session_state._sim_mana_pool = _np
+                                st.rerun()
                 else:
                     _pr[2].write("")
                 if _pr[3].button("✖", key=f"rm_perm_{_perm_i}_{_perm['name']}_{_pi}"):
@@ -1545,11 +1646,16 @@ with tab_simulate:
             )
             _btn1, _btn2 = _acc3.columns(2)
             if _btn1.button("✨ 確定", key="alt_cast_confirm"):
-                _alt_tap = _compute_tapping(_battlefield, _tapped, _alt_cost_val)
+                _alt_mana_pool = st.session_state.get("_sim_mana_pool", {})
+                _alt_virtual_tapped = [
+                    t or _is_summoning_sick(_battlefield[i], _turn)
+                    for i, t in enumerate(_tapped)
+                ]
+                _alt_tap, _alt_pool_after = _compute_tapping(_battlefield, _alt_virtual_tapped, _alt_cost_val, _alt_mana_pool)
                 if _alt_tap is None:
                     st.error("指定コストでも支払えません。土地が不足しています。")
                 else:
-                    _execute_cast(_ac, _alt_tap)
+                    _execute_cast(_ac, _alt_tap, _alt_pool_after)
             if _btn2.button("✖", key="alt_cast_cancel"):
                 st.session_state._sim_alt_cast_card = None
                 st.rerun()
@@ -1715,10 +1821,15 @@ with tab_simulate:
 
             else:
                 # ── スペル：唱える ───────────────────────────────────────
-                _tap_indices = _compute_tapping(_battlefield, _tapped, card["mana_cost"])
+                _mana_pool = st.session_state.get("_sim_mana_pool", {})
+                _virtual_tapped = [
+                    t or _is_summoning_sick(_battlefield[i], _turn)
+                    for i, t in enumerate(_tapped)
+                ]
+                _tap_indices, _pool_after = _compute_tapping(_battlefield, _virtual_tapped, card["mana_cost"], _mana_pool)
                 _c_cast, _c_alt = row[4].columns(2)
                 if _c_cast.button("✨ 唱える", key=f"cast_{i}_{card['name']}", disabled=(_tap_indices is None)):
-                    _execute_cast(card, _tap_indices)
+                    _execute_cast(card, _tap_indices, _pool_after)
                 if _c_alt.button("🪄 代替", key=f"altcast_{i}_{card['name']}"):
                     st.session_state._sim_alt_cast_card = card
                     st.rerun()
@@ -1741,6 +1852,7 @@ with tab_simulate:
             st.session_state._sim_tapped = []
             st.session_state._sim_pending_effects = []
             st.session_state._sim_alt_cast_card = None
+            st.session_state._sim_mana_pool = {}
             st.rerun()
         if sb2.button(f"➡ ターン{_turn + 1}へ（ドロー）", key="sim_draw"):
             if _library:
@@ -1753,6 +1865,7 @@ with tab_simulate:
                 st.session_state._sim_alt_cast_card = None
                 # アンタップ：全土地を未タップ状態に戻す
                 st.session_state._sim_tapped = [False] * len(_battlefield)
+                st.session_state._sim_mana_pool = {}
                 st.rerun()
             else:
                 st.error("ライブラリが空です。")
@@ -1768,4 +1881,5 @@ with tab_simulate:
             st.session_state._sim_tapped = []
             st.session_state._sim_pending_effects = []
             st.session_state._sim_alt_cast_card = None
+            st.session_state._sim_mana_pool = {}
             st.rerun()
