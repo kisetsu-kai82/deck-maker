@@ -126,6 +126,23 @@ class ScryfallClient:
 
     # ── 候補カード一覧の取得 ────────────────────────────────────────────
 
+    @staticmethod
+    def _sort_candidates_by_exact(candidates: list[dict], query: str) -> list[dict]:
+        """完全一致（英語名または日本語名）を先頭に並べて返す。
+        完全一致がない場合は前方一致 → クエリ長との差が小さい順にフォールバック。
+        """
+        q = query.lower()
+        def _key(c):
+            en = c["en_name"].lower()
+            ja = c["ja_name"].lower()
+            name = ja if ja else en
+            if en == q or (ja and ja == q):
+                return (0, 0)        # 完全一致
+            if name.startswith(q) or en.startswith(q):
+                return (1, len(name))  # 前方一致（短いほど優先）
+            return (2, abs(len(name) - len(q)))  # 長さが近いほど優先
+        return sorted(candidates, key=_key)
+
     def search_candidates(self, query: str, max_results: int = 8) -> list[dict]:
         """クエリに部分一致するカードの候補リストを返す。
 
@@ -168,9 +185,10 @@ class ScryfallClient:
             )
             if resp.status_code == 200:
                 # .get("data", []): "data" キーがなければ空リストを返す
-                cards = resp.json().get("data", [])[:max_results]
+                # ソート前に切り捨てると完全一致が範囲外に落ちるため、全件取得してからソート→切り捨て
+                cards = resp.json().get("data", [])
                 if cards:
-                    return [_to_candidate(c) for c in cards]
+                    return self._sort_candidates_by_exact([_to_candidate(c) for c in cards], query)[:max_results]
         except Exception:
             pass  # ネットワークエラーなどは無視して次の検索へ
 
@@ -183,8 +201,8 @@ class ScryfallClient:
                 timeout=10,
             )
             if resp.status_code == 200:
-                cards = resp.json().get("data", [])[:max_results]
-                return [_to_candidate(c) for c in cards]
+                cards = resp.json().get("data", [])
+                return self._sort_candidates_by_exact([_to_candidate(c) for c in cards], query)[:max_results]
         except Exception:
             pass
 
