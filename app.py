@@ -895,6 +895,8 @@ with tab_cards:
     input[data-testid="stNumberInputField"] {
         text-align: center;
         font-size: 0.85rem;
+        width: 3.5rem !important;
+        min-width: unset !important;
     }
     input[data-testid="stNumberInputField"]::-webkit-inner-spin-button,
     input[data-testid="stNumberInputField"]::-webkit-outer-spin-button {
@@ -902,11 +904,25 @@ with tab_cards:
         opacity: 1 !important;
         cursor: pointer;
     }
+    /* Streamlit の +/- ボタンを非表示（webkit スピナーのみ使用） */
+    button[data-testid="stNumberInputStepUp"],
+    button[data-testid="stNumberInputStepDown"] {
+        display: none !important;
+    }
+    /* 移動・削除アイコンボタン: カラム内で中央揃え */
+    .stButton {
+        display: flex;
+        justify-content: center;
+    }
+    .stButton > button {
+        padding-left: 0.4rem;
+        padding-right: 0.4rem;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-    # テーブルの列幅比率 [枚数, カード名, タイプ, マナコスト, CMC, 移動, 削除]
-    _CARD_COLS = [4, 5, 2, 2, 1, 1, 1]
+    # テーブルの列幅比率 [枚数, カード名, タイプ, マナコスト, 移動, 削除]
+    _CARD_COLS = [2, 7, 2, 2, 1, 1]
 
     def _card_table_header(container):
         """テーブルのヘッダー行を描画する。container は st の列（column）オブジェクト。"""
@@ -915,16 +931,15 @@ with tab_cards:
         h[1].markdown("**カード名**")
         h[2].markdown("**タイプ**")
         h[3].markdown("**マナコスト**")
-        h[4].markdown("**CMC**")
-        h[5].markdown("**移動**")
-        # h[6] は削除ボタン用（ヘッダーなし）
+        h[4].markdown("**移動**")
+        # h[5] は削除ボタン用（ヘッダーなし）
 
     def _render_card_rows(container, cards, move_btn_label, move_fn, del_fn, set_count_fn, key_prefix):
         """カード一覧の各行を描画する。
 
         container     : 描画先の Streamlit コンテナ（列など）
         cards         : 表示するカードのリスト
-        move_btn_label: 移動ボタンのラベル（"↓" or "↑"）
+        move_btn_label: 移動ボタンのラベル（"⬇" or "⬆"）
         move_fn       : 移動ボタンを押したときに呼ぶ関数（deck.move_to_sideboard など）
         del_fn        : 削除ボタンを押したときに呼ぶ関数（deck.remove_card など）
         set_count_fn  : 枚数変更関数（deck.set_card_count など）
@@ -953,12 +968,11 @@ with tab_cards:
             rc[1].write(card.display_name())
             rc[2].write(primary_type(card.type_line))
             rc[3].write(card.mana_cost)
-            rc[4].write(int(card.cmc))
-            if rc[5].button(move_btn_label, key=f"{key_prefix}_mv_{card.name}"):
+            if rc[4].button(move_btn_label, key=f"{key_prefix}_mv_{card.name}"):
                 move_fn(card.name)
                 save_deck(deck)
                 st.rerun()
-            if rc[6].button("×", key=f"{key_prefix}_del_{card.name}"):
+            if rc[5].button("🗑", key=f"{key_prefix}_del_{card.name}"):
                 del_fn(card.name)
                 save_deck(deck)
                 st.rerun()
@@ -999,7 +1013,7 @@ with tab_cards:
         main_cards,
         f"#### メインデッキ（{deck.total_cards()}枚）",
         "clear_main", deck.clear_cards,
-        "↓",           # メインデッキのカードはサイドへ移動（↓）
+        "⬇",           # メインデッキのカードはサイドへ移動（⬇）
         deck.move_to_sideboard, deck.remove_card,
         deck.set_card_count,
         "main",
@@ -1009,7 +1023,7 @@ with tab_cards:
         sb_cards,
         f"#### サイドボード（{deck.total_sideboard()}枚）",
         "clear_sb", deck.clear_sideboard,
-        "↑",          # サイドボードのカードはメインへ移動（↑）
+        "⬆",          # サイドボードのカードはメインへ移動（⬆）
         deck.move_to_main, deck.remove_sideboard_card,
         deck.set_sideboard_count,
         "sb",
